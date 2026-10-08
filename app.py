@@ -11,43 +11,27 @@ sys.path.append('src')
 from pdf_parser import extract_text_from_pdf
 from toho_ss_search import run_toho_ss_search
 from checker import verify_insurance_data
+from db_notifier import save_record_to_db, load_records_from_db, send_notification_email
 
 # 1. ページ基本設定
 st.set_page_config(
-    page_title="火災保険見積チェッカー - 管理ポータル",
+    page_title="火災保険見積チェッカー - 管理ポータル v2.0",
     page_icon="🏢",
     layout="wide"
 )
-
-HISTORY_FILE = "credentials/history.json"
-
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-def save_history(record):
-    history = load_history()
-    history.insert(0, record)
-    os.makedirs("credentials", exist_ok=True)
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
 
 def parse_pdf_fields(text: str) -> dict:
     """各種保険会社（損保ジャパン、東京海上日動等）に対応した高精度PDF抽出エンジン"""
     data = {
         "customer_name": "",
         "email": "",
-        "building_category": "", # 建物区分
+        "building_category": "戸建て", # 建物区分
         "address": "",           # 所在地
         "area": 0.0,             # 専有面積
         "built_year": "",        # 築年数・建築年月
         "structure": "",         # 建物構造
-        "discount": "なし"
+        "discount": "なし",
+        "has_kakunin_sho": False
     }
     if not text:
         return data
@@ -65,11 +49,10 @@ def parse_pdf_fields(text: str) -> dict:
         data["email"] = email_match.group(0).strip()
 
     # 3. 建物区分 (専用住宅 / 戸建て / マンション / 共同住宅)
-    cat_match = re.search(r'(<用法>|用法[:：\s]*)?([^\n\r<]+)', text)
-    if re.search(r'(専用住宅|戸建|一戸建)', text):
-        data["building_category"] = "戸建て（専用住宅）"
-    elif re.search(r'(マンション|共同住宅)', text):
+    if re.search(r'(マンション|共同住宅)', text):
         data["building_category"] = "マンション"
+    elif re.search(r'(専用住宅|戸建|一戸建)', text):
+        data["building_category"] = "戸建て（専用住宅）"
 
     # 4. 所在地 (<所在地> の後の住所または一般的な住所パターン)
     addr_match = re.search(r'<所在地>\s*([\s\S]*?)(?=<|\n\r|\n)', text)
@@ -119,6 +102,10 @@ def parse_pdf_fields(text: str) -> dict:
     elif re.search(r'(耐震|免震)', text):
         data["discount"] = "耐震/免震割引あり"
 
+    # 9. 建築確認申請書の添付検知
+    if "確認申請" in text or "第4面" in text:
+        data["has_kakunin_sho"] = True
+
     return data
 
 # --- 2. ログイン認証 ---
@@ -140,7 +127,7 @@ if not st.session_state.logged_in:
     st.stop()
 
 # --- 3. メイン画面レイアウト ---
-st.title("🏢 火災保険見積りチェッカー - 管理ポータル")
+st.title("🏢 火災保険見積りチェッカー - 管理ポータル v2.0")
 
 st.sidebar.markdown(f"**ログインユーザー:** 社内共有アカウント")
 if st.sidebar.button("ログアウト"):
@@ -154,8 +141,8 @@ with col1:
 with col2:
     st.metric(label="現在の状況", value="🟢 待機中 (メールチェック中)")
 with col3:
-    history_data = load_history()
-    st.metric(label="累計照合件数", value=f"{len(history_data)} 件")
+    history_data = load_records_from_db()
+    st.metric(label="累計照合件数 (SQLite)", value=f"{len(history_data)} 件")
 
 st.markdown("---")
 
@@ -182,13 +169,17 @@ if uploaded_file is not None:
 
             st.write(f"  ・抽出結果: 氏名『{customer_name or '検出なし'}』 | メール『{target_email or '検出なし'}』")
 
+            # 抽出テキスト確認デバッグ用アコーディオン
+            with st.expander("📝 PDFから抽出された生テキスト＆キーワード解析ログ（クリックで確認）"):
+                st.code(extracted_text[:1000] if extracted_text else "（テキストが抽出できませんでした）")
+
             # 氏名・メールが両方無い場合の処理
             if not customer_name and not target_email:
                 status_box.update(label="⚠️ PDFから顧客名・メールアドレス未検出（SS検索スキップ）", state="complete")
                 st.warning("⚠️ PDF内に顧客名（〇〇様）およびメールアドレスが検出されなかったため、TOHO SS 検索はスキップされました。")
                 
-                # 抽出できた主要5項目の結果を一覧表示
-                st.markdown("#### 📄 該当PDFからの解析・抽出項目一覧（5項目）")
+                # 抽出できた主要項目の結果を一覧表示
+                st.markdown("#### 📄 該当PDFからの解析・抽出項目一覧")
                 extracted_summary = [
                     {"チェック項目": "1. 建物区分", "PDF抽出結果": pdf_data["building_category"] or "未検出"},
                     {"チェック項目": "2. 所在地", "PDF抽出結果": pdf_data["address"] or "未検出"},
@@ -199,13 +190,13 @@ if uploaded_file is not None:
                 ]
                 st.table(pd.DataFrame(extracted_summary))
 
-                # 履歴として保存
+                # SQLite データベースに履歴保存
                 record = {
                     "id": datetime.now().strftime("%Y%m%d%H%M%S"),
                     "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "customer_name": "氏名記載なし",
                     "email": "メール記載なし",
-                    "status": "顧客情報未検出",
+                    "status": "SS未検出",
                     "details": {
                         "建物区分": {"status": "抽出完了", "pdf": pdf_data["building_category"] or "未検出", "ss": "-"},
                         "所在地": {"status": "抽出完了", "pdf": pdf_data["address"] or "未検出", "ss": "-"},
@@ -215,7 +206,8 @@ if uploaded_file is not None:
                     },
                     "mismatches": ["顧客名・メールアドレス未検出のためSS照合未実施"]
                 }
-                save_history(record)
+                save_record_to_db(record)
+                send_notification_email("sales@toho-next.com", "【エラー】見積書顧客情報未検出通知", "見積書PDFより顧客名・メールが検出できませんでした。")
 
             else:
                 # Step 2: TOHO SS 自動検索
@@ -235,11 +227,12 @@ if uploaded_file is not None:
                         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "customer_name": customer_name or "不明",
                         "email": target_email or "不明",
-                        "status": f"不整合 ({ss_status})",
+                        "status": "SS未検出",
                         "details": {},
                         "mismatches": [f"SS顧客検索エラー: {ss_status}"]
                     }
-                    save_history(record)
+                    save_record_to_db(record)
+                    send_notification_email(target_email, "【火災見積りチェッカー】SS未検出エラー通知", f"TOHO SS上で該当顧客データが見つかりませんでした (理由: {ss_status})。")
                 else:
                     st.write("🔍 [3/3] 7項目自動照合エンジン実行中...")
                     
@@ -248,6 +241,7 @@ if uploaded_file is not None:
                         "structure": pdf_data["structure"],
                         "area": pdf_data["area"],
                         "address": pdf_data["address"],
+                        "building_category": pdf_data["building_category"],
                         "customer_name": customer_name,
                         "email": target_email,
                         "discount": pdf_data["discount"]
@@ -263,17 +257,31 @@ if uploaded_file is not None:
                         "details": check_result["details"],
                         "mismatches": check_result["mismatches"]
                     }
-                    save_history(record)
+                    save_record_to_db(record)
                     status_box.update(label="✅ 照合処理が完了しました！", state="complete", expanded=False)
                     st.success(f"判定結果: 【{check_result['final_status']}】")
 
+                    # nextall 宛てへの照合完了通知メール
+                    mail_body = f"照合判定結果: 【{check_result['final_status']}】\n"
+                    if check_result["mismatches"]:
+                        mail_body += "\n【不一致項目明細】\n" + "\n".join(check_result["mismatches"])
+                    send_notification_email("nextall@toho-next.com", f"【照合結果】{customer_name} 様 火災保険見積り照合通知", mail_body)
+
 st.markdown("---")
 
-st.markdown("### 📜 照合履歴一覧")
-history_data = load_history()
+st.markdown("### 📜 照合履歴一覧 & 詳細ビュー")
+
+# 仕様書 3.6: フィルター & キーワード検索機能
+col_f1, col_f2 = st.columns([1, 2])
+with col_f1:
+    status_filter = st.selectbox("ステータスフィルター", ["すべて", "完全一致", "一部不一致", "SS未検出"])
+with col_f2:
+    search_kw = st.text_input("顧客名・メールアドレス検索")
+
+history_data = load_records_from_db(status_filter, search_kw)
 
 if not history_data:
-    st.info("まだ照合履歴はありません。PDFをアップロードしてテスト実行を行ってください。")
+    st.info("該当する照合履歴はありません。")
 else:
     df_list = []
     for item in history_data:
@@ -306,13 +314,21 @@ else:
                     st.write(f" ・{m}")
             
             if selected_item.get("details"):
-                st.markdown("#### 抽出・照合データ一覧")
-                detail_rows = []
-                for k, v in selected_item["details"].items():
-                    detail_rows.append({
-                        "チェック項目": k,
-                        "判定": v["status"],
-                        "PDF抽出結果": v["pdf"],
-                        "TOHO SS登録データ": v["ss"]
-                    })
-                st.table(pd.DataFrame(detail_rows))
+                st.markdown("#### 7項目照合データ比較 (Side-by-Side)")
+                
+                # 仕様書 3.6: 不一致項目の赤字背景ハイライト表示
+                def highlight_diff(val):
+                    if val == "不一致":
+                        return "background-color: #ffcccc; color: red; font-weight: bold;"
+                    elif val == "一致":
+                        return "background-color: #e6ffe6; color: green;"
+                    return ""
+
+                det_df = pd.DataFrame([{
+                    "チェック項目": k,
+                    "判定": v["status"],
+                    "TOHO SS登録データ": v["ss"],
+                    "見積書抽出データ": v["pdf"]
+                } for k, v in selected_item["details"].items()])
+
+                st.dataframe(det_df.style.map(highlight_diff, subset=["判定"]), use_container_width=True)
