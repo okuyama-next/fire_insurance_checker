@@ -1,0 +1,14 @@
+# 秘密情報・セッション情報の除外
+credentials/
+state.json
+token.json
+client_secret.json
+
+# PDF等のダウンロードフォルダ・Pythonキャッシュ
+downloads/
+__pycache__/
+*.pyc
+.env
+
+# Streamlit 設定
+.streamlit/
